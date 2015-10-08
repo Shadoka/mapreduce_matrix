@@ -1,8 +1,9 @@
-package algorithms
+package src.algorithms
 
-import scala.collection.mutable.ListBuffer
+import algorithms.MatrixMultiplication
 import model.Matrix
 import model.Vector
+import scala.collection.mutable.ListBuffer
 
 object Main {
 

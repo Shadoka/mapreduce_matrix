@@ -1,5 +1,8 @@
 package model
 
+/**
+ * Dummy Vector
+ */
 class Vector[T] (size: Int, gen: (Int) => T) {
   val items = for (index <- 0 until size) yield gen(index)
 

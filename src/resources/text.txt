@@ -1,0 +1,487 @@
+When I wrote the introductory article for libjit, I aimed it at programmers who know what JITs are, at least to some extent. I did mention what a JIT is, but only very briefly. The purpose of this article is to provide a better introductory overview of JITing, with code samples that don't rely on any libraries.
+
+Defining JIT
+JIT is simply an acronym for "Just In Time". That, in itself, doesn't help much - the term is quite cryptic and seems to have little to do with programming. First, let's define what "a JIT" actually refers to. I find the following way to think about this useful:
+
+ Whenever a program, while running, creates and runs some new executable code which was not part of the program when it was stored on disk, it’s a JIT.
+What about the historical usage of the term "JIT", though? Luckily, John Aycock from the University of Calgary has written a very interesting paper named "A Brief History of Just-In-Time" (google it, PDFs are available online) looking at JIT techniques from a historical point of view. According to Aycock's paper, the first mention of code generation and execution during program runtime is apparent as early as McCarthy's LISP paper from 1960. In later work, such as Thompson's 1968 regex paper, it was even more apparent (regexes are compiled into machine code and executed on the fly).
+
+The term JIT was first brought into use in computing literature by James Gosling for Java. Aycock mentions that Gosling has borrowed the term from the domain of manufacturing and started using it in the early 1990s.
+
+This is as far as I'll go into history here. Read the Aycock paper if you're interested in more details. Let's now see what the definition quoted above means in practice.
+
+JIT - create machine code, then run it
+I think that JIT technology is easier to explain when divided into two distinct phases:
+
+Phase 1: create machine code at program run-time.
+Phase 2: execute that machine code, also at program run-time.
+Phase 1 is where 99% of the challenges of JITing are. But it's also the less mystical part of the process, because this is exactly what a compiler does. Well known compilers like gcc and clang translate C/C++ source code into machine code. The machine code is emitted into an output stream, but it could very well be just kept in memory (and in fact, both gcc and clang/llvm have building blocks for keeping the code in memory for JIT execution). Phase 2 is what I want to focus on in this article.
+
+Running dynamically-generated code
+Modern operating systems are picky about what they allow a program to do at runtime. The wild-west days of the past came to an end with the advent of protected mode, which allows an OS to restrict chunks of virtual memory with various permissions. So in "normal" code, you can create new data dynamically on the heap, but you can't just run stuff from the heap without asking the OS to explicitly allow it.
+
+At this point I hope it's obvious that machine code is just data - a stream of bytes. So, this:
+
+unsigned char[] code = {0x48, , };
+Really depends on the eye of the beholder. To some, it's just some data that could represent anything. To others, it's the binary encoding of real, valid x86-64 machine code:
+
+mov %rdi, %rax
+So getting machine code into memory is easy. But how to make it runnable, and then run it?
+
+Let's see some code
+The rest of this article contains code samples for a POSIX-compliant Unix OS (specifically Linux). On other OSes (like Windows) the code would be different in the details, but not in spirit. All modern OSes have convenient APIs to implement the same thing.
+
+Without further ado, here's how we dynamically create a function in memory and execute it. The function is intentionally very simple, implementing this C code:
+The main 3 steps performed by this code are:
+
+Use mmap to allocate a readable, writable and executable chunk of memory on the heap.
+Copy the machine code implementing add4 into this chunk.
+Execute code from this chunk by casting it to a function pointer and calling through it.
+Note that step 3 can only happen because the memory chunk containing the machine code is executable. Without setting the right permission, that call would result in a runtime error from the OS (most likely a segmentation fault). This would happen if, for example, we allocated m with a regular call to malloc, which allocates readable and writable, but not executable memory.
+
+Digression - heap, malloc and mmap
+Diligent readers may have noticed a half-slip I made in the previous section, by referring to memory returned from mmap as "heap memory". Very strictly speaking, "heap" is a name that designates the memory used by malloc, free et. al. to manage runtime-allocated memory, as opposed to "stack" which is managed implicitly by the compiler.
+
+That said, it's not so simple :-) While traditionally (i.e. a long time ago) malloc only used one source for its memory (the sbrk system call), these days most malloc implementations use mmap in many cases. The details differ between OSes and implementations, but often mmap is used for the large chunks and sbrk for the small chunks. The tradeoffs have to do with the relative efficiency of the two methods of requesting more memory from the OS.
+
+So calling memory provided by mmap "heap memory" is not a mistake, IMHO, and that's what I intend to keep on doing.
+
+Caring more about security
+The code shown above has a problem - it's a security hole. The reason is the RWX (Readable, Writable, eXecutable) chunk of memory it allocates - a paradise for attacks and exploits. So let's be a bit more responsible about it. Here's some slightly modified code:
+It's equivalent to the earlier snippet in all respects except one: the memory is first allocated with RW permissions (just like a normal malloc would do). This is all we really need to write our machine code into it. When the code is there, we use mprotect to change the chunk's permission from RW to RX, making it executable but no longer writable. So the effect is the same, but at no point in the execution of our program the chunk is both writable and executable, which is good from a security point of view.
+
+What about malloc?
+Could we use malloc instead of mmap for allocating the chunk in the previous snippet? After all, RW memory is exactly what malloc provides. Yes, we could. However, it's more trouble than it's worth, really. The reason is that protection bits can only be set on virtual memory page boundaries. Therefore, had we used malloc we'd have to manually ensure that the allocation is aligned at a page boundary. Otherwise, mprotect could have unwanted effects from failing to enabling/disabling more than actually required. mmap takes care of this for us by only allocating at page boundaries (because mmap, by design, maps whole pages).
+
+Tying loose ends
+This article started with a high-level overview of what we mean when we say JIT, and ended with hands-on code snippets that show how to dynamically emit machine code into memory and execute it.
+
+The technique shown here is pretty much how real JIT engines (e.g. LLVM and libjit) emit and run executable machine code from memory. What remains is just a "simple" matter of synthesizing that machine code from something else.
+
+LLVM has a full compiler available, so it can actually translate C and C++ code (through LLVM IR) to machine code at runtime, and then execute it. libjit picks the ball up at a much lower level - it can serve as a backend for a compiler. In fact, my introductory article on libjit already demonstrates how to emit and run non-trivial code with libjit. But JITing is a more general concept. Emitting code at run-time can be done for data structures, regular expressions and even accessing C from language VMs. Digging in my blog's archives helped me find a mention of some JITing I did 8 years ago. That was Perl code generating more Perl code at run-time (from a XML description of a serialization format), but the idea is the same.
+
+This is why I felt that splitting the JITing concept into two phases is important. For phase 2 (which was explained in this article), the implementation is relatively obvious and uses well defined OS APIs. For phase 1, the possibilites are endless and what you do ultimately depends on the application you're developing.
+Despite a Supreme Court ruling allowing a controversial drug to be used for lethal injections in Oklahoma, death-penalty states are finding it harder to carry out executions as they struggle to obtain and properly use limited supplies of ever-changing combinations of lethal injection drugs.
+
+Prison officials in Texas and Virginia have improvised a short-term solution by trading drugs for lethal injections. Both Ohio and Nebraska have sought to buy a drug no longer available in the United States from overseas only to be told by the federal Food and Drug Administration that importing the drug is illegal.
+
+Continue reading the main story
+RELATED COVERAGE
+
+Protestors against the death penalty outside the Supreme Court in June.Justices Hear Capital Cases That Elicit a Muted ToneOCT. 7, 2015
+The inmates who brought the case challenged the use of the sedative midazolam in executions, saying it did not reliably render the person unconscious.Supreme Court Allows Use of Execution Drug JUNE 29, 2015
+Richard GlossipOklahoma Governor Grants Richard Glossip a Stay of ExecutionSEPT. 30, 2015
+Executions in Mississippi have been postponed for months over a federal lawsuit challenging the state’s three-drug protocol. The delay will stretch into next year, with a trial scheduled in July 2016. And in Montana on Tuesday, a judge blocked the state from carrying out executions, ruling that one of the two drugs it planned to use did not comply with the state law governing lethal injections. The only way Montana can resume executions with that drug, the judge said, is by having the State Legislature modify the law.
+
+Photo
+
+Several states appear to be reluctant to use midazolam, in part because of its involvement in three high-profile executions in which prisoners appeared to suffer last year in Oklahoma, Ohio and Arizona. Credit Sue Ogrocki/Associated Press
+“Over time lethal injection has become only more problematic and chaotic,” said Deborah W. Denno, a professor at Fordham Law School and an expert on lethal injections.
+
+Oklahoma last week halted the execution of Richard E. Glossip, who was part of the challenge the Supreme Court had turned down, after officials realized two hours before it was to take place that the state’s supplier had sent prison officials the wrong drug. The error led to a court-ordered stay of the three executions scheduled in October and November while officials conduct an investigation.
+
+In June, the Supreme Court ruled against Mr. Glossip and two other Oklahoma death-row inmates who argued that one of the drugs in the state’s three-drug protocol — midazolam, a short-acting sedative — was unreliable. But the court’s decision has had little impact, experts said. Several states appear to be reluctant to use midazolam in part because of its involvement in three high-profile executions in which prisoners appeared to suffer last year, in Oklahoma, Ohio and Arizona.
+
+The apprehension over midazolam, combined with a drug shortage caused by manufacturers’ ceasing production or limiting how drugs can be used, has made it increasingly difficult for states to obtain drugs and carry out executions without delays, mistakes or controversies, and without pushing the legal limits of how drugs can be obtained.
+
+The scramble for drugs has caused some states to embrace or consider more unusual or more antiquated ways of putting inmates to death.
+
+In 2014, Tennessee authorized prison officials to use the electric chair if lethal-injection drugs were unavailable. Gov. Gary R. Herbert of Utah signed a bill into law in March approving firing squads when drugs cannot be obtained. In April, Oklahoma made nitrogen gas its new backup method. In Louisiana, where executions have been postponed following a federal lawsuit over its lethal-injection system, prison officials recommended in a report in February that nitrogen gas be adopted as an alternative method, through the use of a mask or other device but not a gas chamber.
+
+Lethal injections in many of the nation’s 31 death-penalty states have become increasingly varied in the type, combination and source of drugs used. The six executions in six states in January 2014 were conducted using four different protocols, according to the Death Penalty Information Center, a group that opposes capital punishment.
+
+In one of those cases, two drugs — midazolam and hydromorphone — were used together for the first time for an execution in the United States. The Ohio inmate who was injected with them in January 2014, Dennis McGuire, appeared to struggle for several minutes.
+
+One year later, Ohio officials said they would no longer use the two-drug combination they had used on Mr. McGuire and postponed all executions planned for 2015 until they obtained new drugs. As it prepares to resume executions in 2016, Ohio’s search for new drugs earned it a warning from federal authorities, after prison officials explored buying a sedative, sodium thiopental, from overseas. In June, an Food and Drug Administration official told the state in a letter that “there is no F.D.A.-approved application for sodium thiopental, and it is illegal to import an unapproved new drug into the United States.”
+
+Ohio officials declined to answer questions about the letter. JoEllen Smith, a spokeswoman for the state’s Department of Rehabilitation and Correction, said the agency “continues to seek all legal means to obtain the drugs necessary to carry out court-ordered executions.”
+
+In Nebraska, where proponents of the death penalty have been fighting a vote in May by state legislators to abolish capital punishment, prison officials ordered lethal-injection drugs from India but said they had not received them. A spokesman for the Nebraska Department of Correctional Services said hundreds of vials and capsules of sodium thiopental and pancuronium bromide were ordered at a cost of more than $50,.
+
+Despite the Supreme Court’s ruling allowing the use of midazolam, Florida has been blocked for months in using it as part of its three-drug method because of legal challenges over midazolam raised by a death-row inmate, Jerry Correll. The Florida Supreme Court ruled against him on Friday.
+
+In Texas, the execution of Michael Yowell in 2013 marked the first time the state had used a sedative known as pentobarbital that was made not by a drug manufacturer but by a compounding pharmacy. Such pharmacies are largely unregulated by the F.D.A. Texas changed its protocol from a three-drug cocktail to a single drug after its stock of one of the drugs expired and it was unable to obtain a new shipment.
+
+Virginia found itself in a similar situation as it prepared to execute Alfredo R. Prieto last week for the murders of a Virginia couple in 1988. Virginia uses a three-drug combination that includes midazolam. The state’s stock of midazolam was set to expire, and officials were unable to obtain additional supplies, according to court documents. Virginia wanted another sedative, pentobarbital, and turned to Texas for help.
+
+Texas prison officials donated three vials of pentobarbital to the Virginia Department of Corrections for Mr. Prieto’s execution, and two Virginia prison employees traveled to Texas in late August to bring the vials to Virginia, according to court papers. Texas was returning a favor: In 2013, Texas officials facing a shortage of pentobarbital were given the drug by Virginia.
+
+“Even if the transactions between states do not comply with law, there is no recourse for death-sentenced prisoners,” said Megan McCracken, a lethal-injection expert with the Death Penalty Clinic at the University of California, Berkeley, School of Law. “Over the years, we have seen states obtain drugs for execution in ways that clearly do not comply with legal and regulatory frameworks.”
+
+A spokesman for the Texas Department of Criminal Justice said the supply of pentobarbital given to Virginia in August was legally purchased from a compounding pharmacy and tested for potency and purity. He said Texas law prohibited the agency from disclosing the supplier’s identity.
+
+Lawyers for Mr. Prieto questioned the efficacy of the drug. Virginia officials argued that Texas has used compounded pentobarbital successfully in 24 executions in two years. A federal judge sided with Virginia, and allowed Mr. Prieto’s execution to proceed last week.
+Svetlana Alexievich, a Belarussian journalist and prose writer, won the Nobel Prize in Literature on Thursday “for her polyphonic writings, a monument to suffering and courage in our time,” the Swedish Academy announced.
+
+Ms. Alexievich, 67, is the 14th woman to win the literature prize. Sara Danius, permanent secretary of the Swedish Academy, said she had created “a history of emotions — a history of the soul, if you wish.”
+
+Ms. Alexievich’s works often blend literature and journalism. She is best known for giving voice to women and men who lived through World War II, the Soviet occupation of Afghanistan that lasted from 1979 to 1989, and the Chernobyl nuclear disaster of 1986.
+
+“She’s devised a new kind of literary genre,” Ms. Danius said, adding, “It’s a true achievement not only in material but also in form.”
+
+Continue reading the main story
+RELATED COVERAGE
+
+From the Archives: Past Winners of the Nobel Prize in LiteratureOCT. 8, 2015
+Nobel Prize in Chemistry Awarded to Tomas Lindahl, Paul Modrich and Aziz Sancar for DNA StudiesOCT. 7, 2015
+Arthur B. McDonald, at Queen's University in Ontario, won the Nobel Prize in Physics on Tuesday with Takaaki Kajita.Takaaki Kajita and Arthur McDonald Share Nobel in Physics for Work on NeutrinosOCT. 6, 2015
+Nobel Prize in Medicine Awarded to 3 Scientists for Parasite-Fighting TherapiesOCT. 5, 2015
+Perhaps her most acclaimed book is “War’s Unwomanly Face” (1988), based on interviews with hundreds of women who took part in World War II. The book is the first in a grand cycle, “Voices of Utopia,” that depicted life in the Soviet Union from the point of view of ordinary citizens.
+
+Continue reading the main story
+Test Your Nobel Prize Knowledge
+The Nobel Prizes have also led to controversy, intrigue and, at times, serious second guessing. Test your knowledge of the prizes.
+
+
+In the United States, Ms. Alexievich is best known for the oral history “Voices From Chernobyl: The Oral History of a Nuclear Disaster” which was translated by the writer Keith Gessen and published in 2005 by Dalkey Archive Press. The book, which won the National Book Critics Circle Award, is a compilation of interviews with survivors of the nuclear reactor accident. She spent 10 years visiting the Chernobyl zone and conducted more than 500 interviews.
+
+In an interview posted on the press’s website, Ms. Alexievich said her technique of blending journalism and literature was inspired by the Russian tradition of oral storytelling. “I decided to collect the voices from the street, the material lying about around me,” she said. “Each person offers a text of his or her own.”
+
+“By means of her extraordinary method — a carefully composed collage of human voices — Alexievich deepens our comprehension of an entire era,” the academy said.
+
+The Nobel Prize in Literature, one of the most prestigious prizes in the literary world, is given in recognition of a writer’s entire body of work rather than a single title. It has been awarded over the years to international literary giants like Gabriel García Márquez, Albert Camus and Toni Morrison, as well as to more obscure authors.
+
+Over the past decade, the academy has regularly conferred the prize on European writers who were not widely read in English, including the French novelist J. M. G. Le Clézio (2008), the Romanian-German writer Herta Müller (2009) and the Swedish poet and translator Tomas Transtromer (2011). Many were surprised last year when the award went to Patrick Modiano, a French novelist who is well known in his native country but did not have much of a global following when the prize was announced.
+
+Continue reading the main story
+Breaking News Alerts
+Sign up to receive an email from The New York Times as soon as important news breaks around the world.
+
+
+The award to Ms. Alexievich continues that pattern, though, as a nonfiction writer, she stands out from the recent crop of laureates. Her other books in English include “Voices From Chernobyl: Chronicle of the Future” (Aurum Press, 1999) and “Zinky Boys: Soviet Voices From a Forgotten War” (W. W. Norton, 1992).
+
+In a 2012 essay in The New York Review of Books, Ahmed Rashid praised the courage of journalists who chronicled the invasion of Afghanistan and the quagmire that followed.
+
+“As one might expect, there are hardly any Soviet accounts available on how the Soviet Army behaved in Afghanistan,” he wrote. “Only two such books were translated into English. Both ‘Zinky Boys: Soviet Voices From a Forgotten War,’ by Svetlana Alexievich, and ‘The Hidden War: A Russian Journalist’s Account of the Soviet War in Afghanistan,’ by Artyom Borovik, were written by journalists who became dissidents, and both were highly critical of the Soviet officer class and the Soviet system. Both had much to say about the suffering of ordinary soldiers, many of whom were wounded. Both books asked why the Red Army was in Afghanistan, just as many Americans today are asking the same question about their army’s presence in Afghanistan.”
+
+Born to a Belarussian father and a Ukrainian mother in what is now Ivano-Frankivsk, Ukraine, she studied journalism, and after graduation, she began work at a newspaper in Brest, near the Polish border.
+
+The academy said the most significant influences on Ms. Alexievich’s work were the notes by the nurse and author Sofia Fedorchenko (1888–1959) of soldiers’ experiences in the First World War, and the reports by the Belarussian author Ales Adamovich (1927–1994) from the Second World War.
+
+Because of her criticism of the regime in Belarus, a former Soviet republic, Ms. Alexievich has periodically lived abroad, in Italy, France, Germany and Sweden, among other places.
+
+The prize of 8 million Swedish kronor (around $960,) was announced in Stockholm by Ms. Danius.
+WASHINGTON — President Obama personally apologized on Wednesday to the head of Doctors Without Borders for what he described as the mistaken bombing of its field hospital in Kunduz, Afghanistan, promising a full investigation into the episode, which took the lives of nearly two dozen doctors and patients.
+
+But five days after an American AC-130 gunship devastated the medical facility, Mr. Obama’s personal expression of regret in a telephone call from the Oval Office appeared to do little to satisfy the leader of the doctors group, who issued a terse statement saying the president’s apology had been “received.”
+
+Dr. Joanne Liu, the international president of Doctors Without Borders, repeated her demand for an independent investigation led by the International Humanitarian Fact-Finding Commission to “establish what happened in Kunduz, how it happened, and why it happened.”
+
+Continue reading the main story
+RELATED COVERAGE
+
+Gen. John F. Campbell, the American commander in Afghanistan, before testifying at a congressional hearing on Tuesday in Washington.General Is Said to Think Afghan Hospital Airstrike Broke U.S. RulesOCT. 6, 2015
+video Aid Group Condemns Kunduz StrikeOCT. 7, 2015
+video Commander Discusses Hospital AirstrikeOCT. 6, 2015
+Doctors Without Borders Calls for Inquiry Into Kunduz Hospital AttackOCT. 7, 2015
+A relative carried Madina, 8, into an emergency room in Kabul.Survivors Tell of Kunduz Hospital in FlamesOCT. 3, 2015
+White House officials said the president had confidence that the investigative effort now underway, including an inquiry being conducted by the Department of Defense, would be “transparent, it will be thorough, and it will be objective.”
+
+Photo
+
+Dr. Joanne Liu, the president of Doctors Without Borders, spoke on Wednesday in Geneva. Credit Denis Balibouse/Reuters
+Direct presidential apologies to victims of American actions abroad are rare, but not unheard-of. In 2012, Mr. Obama wrote a letter of apology to President Hamid Karzai of Afghanistan after several copies of the Quran were burned by American military personnel, leading to violent protests across that country. In 2004, President George W. Bush apologized for the treatment of Iraqi prisoners at the Abu Ghraib military prison, telling world leaders that he was “sorry for the humiliation.”
+
+Whether to deliver an apology is a difficult and sensitive decision for any president, but particularly for this one. Mr. Obama has been pilloried since the beginning of his presidency by Republicans who accuse him of being a serial apologizer for America. Mitt Romney, the Republican candidate for president in 2012, wrote a book titled “No Apology,” a not-so-subtle dig at Mr. Obama. And Dick Cheney, the former vice president, recently published a book renewing the apology criticism of the president.
+
+In this case, Mr. Obama proceeded with caution. Two days after the bombing, he expressed his “deepest condolences” to families of the hospital victims, calling it a “tragic incident.” But he and other White House officials resisted further comment for several days, citing the need to let investigations continue.
+
+That changed on Wednesday after grim and detailed congressional testimony by Gen. John F. Campbell, the American commander in Afghanistan, who told lawmakers the attack was “a U.S. decision made within the U.S. chain of command.”
+
+Continue reading the main story
+U.S. Airstrikes, Afghan Casualties
+Examples of large civilian casualty incidents in Afghanistan caused by the United States military.
+
+
+At the White House on Wednesday, Josh Earnest, the press secretary, said that “when the United States makes a mistake, we own up to it, we apologize.” He explained the shift in the decision to apologize by saying that Mr. Obama had decided “that he had learned enough about this matter to conclude that it was appropriate for him to offer an apology.”
+
+White House officials said Mr. Obama told Dr. Liu that he would make any changes necessary to ensure that such incidents were less likely in the future. And they said that the president promised a “full accounting” of who was to blame, and whether the military’s rules of engagement need to change.
+
+That may not be enough for Doctors Without Borders, which has said they do not believe the three investigations that have been begun into the incident — by NATO and a joint United States-Afghan group and the Defense Department — are independent enough to find the truth about what happened.
+
+In her statement responding to Mr. Obama’s call, Dr. Liu reiterated the organization’s request that the United States “consent to an independent investigation led by the International Humanitarian Fact-Finding Commission.”
+
+Continue reading the main story
+
+Graphic: A Hospital Is Hit in the Battle for Kunduz
+The use of the word “consent” in her statement was central to the group’s demand that the United States endorse a more independent investigation. The International Humanitarian Fact-Finding Commission, a body set up under the Geneva Conventions, can investigate violations of international humanitarian law, but only if the countries involved give their permission. In this case that would mean extracting the blessings of both Afghanistan and the United States, which seems unlikely.
+
+The commission is made up of 15 members, elected by the 76 countries that recognize its authority. Neither the United States nor Afghanistan is among the 76. The commission was created in 1991 but has never been used.
+
+At a news conference in Geneva on Wednesday, Dr. Liu said that patients at the Kunduz hospital burned in their beds, and that doctors, nurses and other staff members were killed as they worked. “Our colleagues had to operate on each other,” she said. “One of our doctors died on an improvised operating table — an office desk — while his colleagues tried to save his life.”
+
+Jason Cone, the executive director of Doctors Without Borders in the United States, said that the organization’s staff called the office of the chairman of the Joint Chiefs of Staff during the bombardment of the hospital. Mr. Cone would not discuss the contents of the calls, saying that Doctors Without Borders wanted to preserve the privileged nature of its communications with the government.
+
+Continue reading the main story
+What Is the International Humanitarian Fact-Finding Commission?
+But he did say that the chairman’s office was the same office to which Doctors Without Borders had provided GPS coordinates for the hospital on Sept. 30. The group also provided the same GPS coordinates to the American-led coalition in Afghanistan on Sept. 29.
+
+Mr. Cone could not say who or what office at the American-led coalition in Afghanistan was contacted during the attack.
+
+“All we know is that our one hospital was struck repeatedly after we told them where we were located, and called them in desperation to stop the attack,” he said.
+
+The targeting of a medical facility is considered a war crime, if it is proved to be deliberate. But attacks on medical facilities have occurred with some regularity, and assessing whether they were deliberate has been difficult. On Wednesday, Physicians for Human Rights, an advocacy group, said it had confirmed that Russian airstrikes had damaged three medical facilities in Syria.
+
+“With these actions, Russia is damaging hospitals, putting patients and medical staff at risk, and depriving civilians of lifesaving access to health care,” the group said in a statement.
+
+Michael D. Shear reported from Washington, and Somini Sengupta from the United Nations. Matthew Rosenberg contributed reporting from Washington, and Nick Cumming-Bruce from Geneva.
+The discs came like a swarm of locusts, burrowing into post boxes and sliding through mail slots. They popped out of cereal boxes and appeared on meal trays during airline flights. They fell out of magazines and Happy Meals. They were stocked at the checkout counters of Best Buy, near the popcorn at Blockbuster, on bookshelves at Barnes & Noble. The ubiquity of AOL discs—those free marketing materials sent by American Online in the 90s to entice people to sign up for internet service—could be likened to world domination.
+
+But they were also annoying. If you didn't end up using your "50 Hours Free!," the discs would likely end up in the trash. A satirical newspaper in California, The Larely Beagle, once published a faux report about how there were so many unused AOL trials in landfills that it was contaminating the nation's drinking water.
+
+It bothered Brian Larkin, then a 20-something in Los Angeles, to see his roommates repeatedly throwing the CDs into the garbage. So he started collecting them in a bin to recycle later. But he never got around to it, and when he moved, he found the bin, now piled high with the shiny discs, and had a revelation: They were beautiful.
+
+On Motherboard: God Didn't Say What's Kosher on Mars
+
+
+The Magic Johnson branded AOL disc. Photo courtesy of Lydia Sloan Cline
+
+Larkin, who now has well over 2, AOL discs in his possession, thought he was the only one collecting these things. Soon, he realized there was a small, but tenacious, community of AOL disc collectors.
+
+There was Lydia Sloan Cline, who Larkin found through her now-defunct Geocities site called Lydia's AOL Disk Collection. Then there was Sparky Haufle, who ran an Anglefire website and wrote the complete collector's guide, AOL CD Collecting: The New High-tech Version of Baseball Card Collecting. There was Jim McKenna and John Lieberman, who collected the discs for the express purpose of dumping them back at AOL's headquarters. And there was Bustam Halim, who according to Wired is nicknamed "the Leader."
+
+Watch: LARPing Saved My Life
+
+
+Of the bunch, Sloan Cline is arguably the most prolific collector. By her estimates, she has over 4, unique AOL discs stored in the basement of her home in Kansas. Every CD in her collection is different: There are discs in every color, ones in plastic cases or shrink-wrap packaging, ones promising various hours on the free trial. Versions one through three came on floppy disk, and some of the early ones came in metal tins—Sloan Cline has those kinds, too. There were also branded AOL discs, like her prized Marvel Spider-Man disc, and foreign AOL discs, which she got from her friends in Canada and Argentina.
+
+"I probably have one of the most extensive collections—well, me and Bustam," she said.
+
+
+
+A selection of discs from Bustam Halim's collection. Photo courtesy of Bustam Halim
+
+Halim, whose collection runs at least 3, discs, started collecting in 1999 "because they were free," and he liked the idea of a hobby that didn't require spending any money. Unlike other collectors, who've been known to shell out upwards of $100 on an ultra-rare CD, Halim claims he's never paid more than a few bucks for a disc. Instead, he'd make frequent trips to the swap meet in Oakland, where there was a section devoted to "all kinds of computer-related junk." There, he'd sometimes find a really rare AOL disc for $1—better than anything he could find on eBay, and for a fraction of the price.
+
+Each morning, Halim says he'd spend about an hour admiring his collection, organizing the discs by their serial numbers, and updating his website, cdcult.com. Then he'd head into his job at a tech company, where all of his coworkers knew about his collecting obsession because he'd asked them to give him their AOL CDs. For the most part, they did, since he was basically "asking for this junk mail." His favorite CD is one that an employee snagged at a computer convention in Japan. It's a plain-looking disc, with very little art on the packaging, but it's rare—no one who wasn't at the convention has a copy.
+
+"I probably had, at one point, at least 20, CDs," Halim said, mainly from the donations from his coworkers. "I threw away a lot of them because there were copies."
+
+
+
+An AOL disc from Canada. Photo courtesy of Lydia Sloan Cline
+
+AOL disc collecting isn't about quantity—it's about diversity. There were AOL discs in every color; discs in all kinds of designs; branded discs (Larkin's favorite CD is one from a Frisbee partnership); ones in weird packaging, like a one-time disc design that came in a plastic purse. Unique designs were determined by subtle differences in the color, design, and text. Two discs might look alike, except one promises "500 hours free!" and the other only offers "200 hours free!" Within one "substyle"—the gold edition, for example—there might be 15 variations in the text. Those all count as unique designs, which can also be catalogued by the serial numbers on the discs.
+
+"There were hundreds of designs, and about 20 percent of them were rare ones," says Sloan Cline. "Those are what we fought over."
+It's not that AOL collecting was competitive, per se—just that, when there are only a handful of people who care about your hobby, every small victory or failure is amplified. Halim and Sloan Cline both have tin-packaged AOL CDs in their collections, but Sloan Cline's is still in the original wrapping—something that Halim resents. When, in 2002, AOL invited Sloan Cline and her family to a party in New York for the launch of AOL Version 8, Halim fumed with jealousy. "I hated her for that," he said. "I was so jealous."
+
+(For her part, Sloan Cline said the party was a blast. "They were so thrilled that someone was collecting their discs instead of shooting bullet holes through them that they invited us.")
+
+
+
+The Mad Magazine branded AOL disc. Photo courtesy of Lydia Sloan Cline
+
+There's no record of how many AOL discs were distributed, but Jan Brant, AOL's former chief marketing officer, estimates that the number is in the thousands. On a Quora thread, Brant said the marketing campaign cost more than $300 million, but it was worth it: "We were logging in new subscribers at the rate of one every six seconds."
+
+It's this ubiquity, the annoying success of their campaign, that makes AOL CDs important to remember, according to Jason Scott, a digital historian with the Internet Archive. "They were, at one time, half of all the CDs produced in the US," Scott explains. "So the story of AOL discs is part of the story of software, and it's important for me to get them."
+
+There's already a small collection of discs catalogued at the Smithsonian's Museum of American History, but Scott wants his own. In May, he put out his own request to amass old AOL CDs on behalf of the Internet Archive. The discs are interesting, he says, because their evolution traces a history of the internet. The oldest discs promised access to a virgin internet, but the newer ones said things like "Come back!" As peoples' relationship to the internet changed, so did AOL discs.
+
+Scott has amassed about 300 CDs so far, all via donation. "For a collector, there's often an issue where like, they only made 20 Beanie Babies with this one signature, so now each of those is worth a ridiculous amount. AOL collecting isn't like that," he explains, "There's no value in that market."
+
+
+
+A selection of Canadian AOL discs. Image via Wikimedia Commons
+
+Earlier this year, Verizon acquired AOL for $4.4 billion. It signals the official end of an era, when AOL wasn't just a gateway to the internet—it was the internet. This kind of end to the AOL story make collectors all the more sentimental about their discs, like precious artifacts in a technologically-advanced world.
+
+Collecting is based on nostalgia: People collect Pez dispensers and stamps and tin lunchboxes not because they're inherently valuable or interesting, but because they remind people of a time in their life. That's why Sloan Cline has kept her collection, which today sits filed away in wire CD racks in her basement, mostly in their original packaging.
+
+"I really believe that maybe ten years, 15 years from now, people who remembered [AOL discs] from fifth grade or had their first interent experience with it, they're gonna look back and say, 'I remember that!' and I really believe that these discs will be worth something," she said.
+
+Larkin doesn't think the discs will ever be worth anything, and neither does Halim. But neither of them are ready to give up the collections. It's worth something to them.
+
+Sometimes Halim will just sit and stare at the discs, with their geometric designs, and pass hours that way. "It's hard to explain," he said, "but they're just so beautiful to me."
+YC Research
+by Sam Altman
+Our mission at YC is to enable as much innovation as we can.  Mostly this means funding startups.  But startups aren’t ideal for some kinds of innovation—for example, work that requires a very long time horizon, seeks to answer very open-ended questions, or develops technology that shouldn’t be owned by any one company.
+
+We think research institutions can be better than they are today.  So we’re starting a new research lab, which we’re calling YC Research, to work on some of these areas.
+
+We’re going to start YCR with one group (which we should be ready to announce in a month or two) and if that goes well, we’ll add others. 
+
+YCR is a non-profit.  Any IP developed will be made available freely to everyone.  (The researchers will, of course, have full discretion over when they’re ready to release their work, and we’ll have a process in place to address technology that could be dangerous.)  Because of the openness, the researchers will be able to freely collaborate with people in other institutions. 
+
+We’re not doing this with the goal of helping YC’s startups succeed or adding to our bottom line.  At the risk of sounding cliché, this is for the benefit of the world.  As we’ve seen throughout history, new technological breakthroughs help all of us.  Fundamental research is critical to driving the world forward, and funding for it keeps getting cut. [1] 
+
+To start off, I’m going to personally donate $10 million, and we will raise more money for specific groups soon.  In addition to salary, researchers at YCR will also receive equity in Y Combinator as part of their compensation. [2]
+
+YCR researchers will be full-time YC employees (instead of us making grants to other organizations).  We’ll especially welcome outsiders working on slightly heretical ideas (just like we do for the startups we fund) and we’ll try to keep things small—we believe small groups can do far more than most people think.  Also, smallness usually means less politics, which has plagued science in recent decades.
+
+The researchers will have full access to YC and the YC network.  YC has a very high problem flux at this point—we fund hundreds of companies per year.  Compensation and power for the researchers will not be driven by publishing lots of low-impact papers or speaking at lots of conferences—that whole system seems broken.  Instead, we will focus on the quality of the output.
+
+We plan to do this for a long time.  If some of these projects take 25 years, that’s perfectly fine with us. 
+
+We’re very excited to see what comes out of this.
+
+ 
+
+
+
+[1] Funding for technological development is actually relatively high, but funding for fundamental research keeps getting cut.  Investors want to fund incremental progress—and the world has gotten very good at delivering that.  This is more valuable than it sounds; incremental progress compounds quickly. 
+
+Since I started studying and working on a Clojure project, I've been using the core.async library. It's a really simple and powerful way of dealing with concurrency, which is also used in the Go language. It's an implementation of Communicating Sequential Processes, and now with ES6 generators we can use it in Javascript too! In this post, I'll be using js-csp. Check out my Introduction to CSP in Javascript - it can be considered "Part 1" of this post.
+
+When I came across Quiescent's TodoMVC implementation, I saw the power of CSP as a front end application framework itself. This post describes an expanded version of the architecture of that TodoMVC app.
+
+The Architecture
+
+The application has an object called state. The state holds the information needed to render the screen.
+
+There's a render process, that triggers a React render (or whatever view framework you want to use) whenever a new state object is put into the render channel.
+
+There are update processes, that transform state according to the data put into the update channels. After transforming the state, the update processes put the new state in the render channel.
+
+There are complex actions processes, that are asynchronous processes that can trigger multiple update processes. It usually involves communication with the server, or any action that takes time to complete.
+
+It's that simple. Those are the basic processes in the framework. Of course, it is possible to run more processes, like a router or websocket process, but let's start with the basic ones.
+
+Application Config
+
+First of all let's create the application config object. An example would be:
+But it’s not all we need—we are dependent on the unpredictable breakthrough jumps to drive humanity forward.  Technology startups today work very well for making a super-efficient piston engine, but they are unlikely to fund the kind of open-ended R+D required to develop a jet engine.
+
+[2] We think it’s important for the researchers to make as much money as they might in at a large company or a startup.  YC equity is fairly low-risk (we fund hundreds of companies per year) and high-reward (they have historically done very well), so it will hopefully be a good solution.
+
+The config object has the state, the render channel renderCh, and the updates and complexActions channels and consumers. I'm going to explain those later.
+
+The start function loads the config, and will start all the processes. I like to put the loaded app in the window object, so I can play with it in the browser console, very much like Clojure's command line.
+
+Get your build flow running (I like to use npm as a build tool) and let's dive into the update processes.
+Every update function will receive two parameters: the state and the data used in the transformation. Then it will return a new state. Since it's a pure function, it's very simple to unit test.
+
+Now let's write a function to initiate a process that takes data from the updates.channels.loading channel, and transforms state:
+It works! :)
+
+The Finished Application
+
+The code for the final application can be seen here, and it can be seen running here. Be sure to open the console, inspect the app object, and play with the channels!
+
+Conclusion
+
+CSP is a simple, powerful and time-tested way of dealing with asynchronous programming. Using it as an application framework is very rewarding. The architecture is robust, and seems to scale well. I'm certainly going to use it in other projects, and I encourage everyone to try it!
+
+Next Steps
+
+I'd like to battle test the framework within a bigger project, to really get a sense of how it will behave.
+
+Most client-side application demands could be translated as an update or complex action, at least the ones triggered by the user. But some could be implemented as ever running processes, initiated in the start function. For instance, a simple router could be written as:
+
+But we'll have many update processes. In this application we have three: view, add and loading. The first changes the word being shown in the screen (by changing state.current), and the second adds a new word. First, the functions:
+
+Updates
+The first thing the process does is to take a value from the render channel. Then, the finishRender channel is created. This is a trick so the process wait for the React.render and window.requestAnimationFrame functions to continue.
+
+Both functions are async, and don't block the main thread when called. That means that right after React.render is called, the expression yield take(finishRender); will be evaluated. That way the process will be paused until any value is put in the finishRender channel.
+
+React.render accepts a callback, and then calls window.requestAnimationFrame. This function waits for the next browser rendering frame and calls another callback.
+
+Whenever the render is started, it waits for the next animation frame to get a new state to render. This way we make sure no unnecessary renders are triggered! Cool, isn't it?
+
+A little modification is needed in the initUpdates process: the new state should be put in the render channel:
+And that's exactly what we wanted.
+
+Rendering
+The free-living dolphins of the Bahamas had come to know researcher Denise Herzing and her team very well. For decades, at the start of each four-month-long field season, the dolphins would give the returning humans a joyous reception: “a reunion of friends,” as Herzing described it. But one year the creatures behaved differently. They would not approach the research vessel, refusing even invitations to bow-ride. When the boat’s captain slipped into the water to size up the situation, the dolphins remained aloof. Meanwhile on board it was discovered that an expeditioner had died while napping in his bunk. As the vessel headed to port, Herzing said, “the dolphins came to the side of our boat, not riding the bow as usual but instead flanking us fifty feet away in an aquatic escort” that paralleled the boat in an organized manner.
+
+The remarkable incident raises questions that lie at the heart of Carl Safina’s astonishing new book, Beyond Words: What Animals Think and Feel. Can dolphin sonar penetrate the steel hull of a boat—and pinpoint a stilled heart? Can dolphins empathize with human bereavement? Is dolphin society organized enough to permit the formation of a funeral cavalcade? If the answer to these questions is yes, then Beyond Words has profound implications for humans and our worldview.
+
+Beyond Words is gloriously written. Consider this description of elephants:
+
+Their great breaths, rushing in and out, resonant in the halls of their lungs. The skin as they moved, wrinkled with time and wear, batiked with the walk of ages, as if they lived within the creased maps of the lives they’d traveled.
+Not since Barry Lopez or Peter Matthiessen were at the height of their powers has the world been treated to such sumptuous descriptions of nature.
+
+Safina would be the first to agree that anecdotes such as Herzing’s lack the rigor of scientific experiments. He tells us that he is “most skeptical of those things I’d most like to believe, precisely because I’d like to believe them. Wanting to believe something can bias one’s view.” Beyond Words is a rigorously scientific work. Yet impeccably documented anecdotes such as Herzing’s have a place in it, because they are the only means we have of comprehending the reactions of intelligent creatures like dolphins to rare and unusual circumstances. The alternative—to capture dolphins or chimpanzees and subject them to an array of human-devised tests in artificial circumstances—often results in nonsense. Take, for example, the oft-cited research demonstrating that wolves cannot follow a human pointing at something, while dogs can. It turns out that the wolves tested were caged: when outside a cage, wolves readily follow human pointing, without any training.
+
+Safina explains how an evolutionary understanding of the emotions helps us to see even humble creatures as individuals. The chemical oxytocin creates feelings of pleasure and a craving for sociality. So widespread is it that it must have originated 700 million or more years ago. Serotonin, a chemical associated with anxiety, is probably equally ancient: crayfish subjected to mild electrical shocks have elevated serotonin levels, and act anxiously. If treated with chlordiazepoxide (a common treatment for humans suffering from anxiety) they resume normal behavior.
+
+The basic repertory of emotions evolved so long ago that even worms exhibit great behavioral sophistication. After a lifetime studying earthworms, Charles Darwin declared that they “deserve to be called intelligent,” for when evaluating materials for plugging their burrows, they “act in nearly the same manner as a man under similar circumstances.” Emotions are the foundation blocks of relationships and personalities. Driven by the same complex mix of emotion-inducing chemicals as ourselves, every worm, crayfish, and other invertebrate has its own unique response to its fellows and the world at large.
+
+Worms and crayfish may have distinct personalities and emotional responses, but their brains are far simpler than ours. Humans fall within a small group of mammals with exceptionally large brains. All are highly social, and it is upon this group—and specifically the elephants, killer whales, bottlenosed dolphins, and wolves—that Safina concentrates. The last common ancestor of these creatures was a primitive, small-brained, nocturnal, shrew-sized mammal that lived around 100 million years ago. The brains, bodies, and societies of these “animal intelligentsia,” as we might call them, are each very different, making it hard to understand their lives.
+
+Safina sees and describes the behaviors of the animals he’s interested in through the eyes of researchers who have dedicated their lives to the study of their subjects. What is it like to be an elephant? Cynthia Moss, who has lived with the elephants of Amboseli National Park in Kenya for four decades, sums them up as “intelligent, social, emotional, personable, imitative, respectful of ancestors, playful, self-aware, compassionate.” It all sounds impressively human, but elephant societies are very different from our own. Female elephants and their young live separately from males, for example, so they have no conception of romantic love or marriage (though the females can be very interested in sex, enough to fake estrus in order to attract male attention).
+
+Much published behavioral science, incidentally, is phrased in a neutral language that distances us from animals. Safina argues that we should use a common language of grief, joy, friendship, and empathy to describe the equivalent responses of both human and other animals. To this I would add the language of ceremony: What other word but “marriage” should be used to describe the ritual bonding, followed by lifelong commitment to their partners, of creatures like the albatross?
+
+Sometimes it is the small things that best reveal shared life experience. When baby elephants are weaned they throw tantrums that rival those of the wildest two-year-old humans. One youngster became so upset with his mother that he screamed and trumpeted as he poked her with his tiny tusks. Finally, in frustration, he stuck his trunk into her anus, then turned around and kicked her. “You little horror!” thought Cynthia Moss as she watched the tantrum unfold.
+
+Clans of female elephants, led by matriarchs, periodically associate in larger groups. As a result, elephants have excellent memories, and are able to recognize up to one thousand individuals. So strong is elephant empathy that they sometimes bury their dead, and will return repeatedly to the skeleton of a deceased matriarch to fondle her tusks and bones. Indeed, an elephant’s response to death has been called “probably the strangest thing about them.” When the Amboseli matriarch Eleanor was dying, the matriarch Grace approached her, her facial glands streaming with emotion, and tried to lift her to her feet. Grace stayed with the stricken Eleanor through the night of her death, and on the third day Eleanor’s family and closest friend Maya visited the corpse. A week after the death the family returned again to express what can only be called their grief. A researcher once played the recording of a deceased elephant’s voice to its family. The creatures went wild searching for their lost relative, and the dead elephant’s daughter called for days after.
+
+Elephants have been known to extract spears from wounded friends, and to stay with infants born with disabilities. In 1990, the Amboseli female Echo gave birth to a baby who could not straighten his forelegs, and so could hardly nurse. For three days Echo and her eight-year-old daughter Enid stayed with him as he hobbled along on his wrists. On the third day he finally managed to straighten his forelegs and, despite several falls, he was soon walking well. As Safina says, “His family’s persistence—which in humans facing a similar situation we might call faith—had saved him.”
+
+Most of us will never see a wild elephant, much less spend the time observing them that is required to understand them as individuals. But there are animals that share our lives, and whose societies, emotional depth, and intelligence are readily accessible. Dogs are often family to us. And it is astonishing how much of a dog’s behavior is pure wolf.
+
+The Canidae—the family to which wolves and dogs belong—is a uniquely American production, originating and evolving over tens of millions of years in North America before spreading to other continents around five million years ago. The American origins of the wolf family did not save them from frontier violence. By the 1920s they had been all but exterminated from the contiguous forty-eight states of the US. Their reintroduction into Yellowstone National Park in January 1995 offered a unique opportunity to follow the fortunes of wolf families as they made their way in a new world. Yellowstone’s wolf research leader Doug Smith says that wolves do three things: “They travel, they kill, and they are social—very social.” But wolves are also astonishingly like us. They can be ruthless in their pursuit of power, to the extent that some will kill their sister’s cubs if it serves their ends. But they will also at times adopt the litters of rivals.
+
+The best wolves are brilliant leaders that pursue lifelong strategies in order to lead their families to success. According to wolf watchers, the greatest wolf Yellowstone has ever known was Twenty-one (wolf researchers use numbers rather than names for individuals). He was big and brave, once taking on six attacking wolves and routing them all. He never lost a fight, but he was also magnanimous, for he never killed a vanquished enemy. And that made him as unusual among wolves as did his size and strength. He was born into the first litter of Yellowstone pups following the reintroduction of wolves in the park. Twenty-one’s big break came at age two and a half when he left his family and joined a pack whose alpha male had been shot just two days earlier. He adopted the dead wolf’s pups and helped to feed them.
+
+A telling characteristic of Twenty-one was the way he loved to wrestle with the little ones and pretend to lose. The wolf expert Rick McIntyre said, “He’d just fall on his back with his paws in the air. And the triumphant-looking little one would be standing over him with his tail wagging.” “The ability to pretend,” McIntyre said, “shows that you understand how your actions are perceived by others. It indicates high intelligence.” That many humans recognize this in dogs, but have failed to see it in wolves, speaks strongly of the need for Safina’s book. For dogs are wolves that came to live with us.
+
+The similarities between wolves and humans are arguably more extensive than those between humans and any other animal. Tough, flexible in social structure, capable of forming pair bonds and fitting into ever-shifting hierarchies, we were made for each other. And when we out-of-Africa apes met up with the arch-typical American canids a few tens of thousands of years ago, a bond was created that has endured ever since. Just who initiated the interspecies relationship is hotly debated. The traditional view is that humans domesticated dogs, but Safina makes a convincing case that the process was driven as much by the wolves as by the humans. The wolves that were better able to read human tendencies and reactions, and were less skittish of human contact, would have gotten access to more food scraps from human camps. And human clans willing to tolerate the wolves would have obtained valuable warnings of the presence of danger from other animals (and other humans). Eventually, Safina says, “we became like each other.” The partnership, however, has had some puzzling effects. The brains of dogs, as well as humans, have shrunk since we began living together, perhaps because we came to rely on each other rather than solely on our own wits.
+
+flannery_2-100815.jpg
+Lisa Denning/Ocean Eyes Photography
+An Atlantic spotted dolphin mother and calf, Bimini, Bahamas, 2007
+Sperm whales have the largest brains on earth—around six times larger on average than our own—while bottlenosed dolphins have the largest brains relative to body size, with the exception of humans. Along with killer whales, these species have a place beside the elephants, dogs, and great apes in the animal intelligentsia. The Cultural Lives of Whales and Dolphins is a comprehensive academic work by researchers who have devoted their careers to studying sperm and killer whales. Ocean-going and deep diving, sperm whales are difficult to study, and researchers can as yet offer only a bare sketch of their societies. But it’s already clear that their social organization has remarkable parallels with that of elephants. Like elephants, sperm whale females and young often live in “clans” of up to thirty individuals, while adult males, except when mating, live separate lives.
+
+Sperm whale clans possess distinctive “dialects” of sonar clicks. These are passed on by learning, and act as markers of clan identity. They are an important part of the whale’s communication system, which enables the creatures to synchronize their diving, feeding, and other activities. So social are sperm whales that females share the care of the young of their clan, for example by staying at the surface with a young whale while its mother dives for food. Clan members are so closely bonded that they spend extended periods at the surface, nuzzling one another or staying in close body contact. As with elephants, clans can gather in large congregations, so it seems reasonable to assume that sperm whales have the capacity to memorize large social networks.
+
+Killer whales (otherwise known as orcas) have a very different social organization. Without doubt their most unusual characteristic is that all male killer whales are deeply involved with their mother. They never leave their mother’s clan, and despite their enormous size (growing to twice the weight of females), their fates remain deeply intertwined with those of their mothers. If their mothers should die, even fully adult males over thirty years old (they can live to over sixty) face an eight-fold increase in their risk of death. Just how and why the orphaned adult males die remains unclear.
+
+Another striking feature of killer whales and near relatives is the extraordinary length of lactation. Short-finned pilot whales lactate for at least fifteen years after birth, even though puberty occurs at between eight and seventeen years. Sperm whales reach sexual maturity at nine to ten years of age, but traces of milk have been found in the stomachs of thirteen-year-olds. Killer whales and humans are unique in that they experience menopause (for the whales typically at around age forty). Because female killer whales can live up to eighty years, around a quarter of females in any group are postreproductive. Yet they remain sexually active. Grandmothers are evidently very important in killer whale societies, almost certainly because of the wisdom they have gathered over a lifetime.
+
+An equally odd aspect of killer whale culture concerns food taboos and ways that whales observe them. In this they offer an extraordinary parallel with some human cultures. One clan of killer whales eats only a single species of salmon. Another kills only one species of seal. When members of a mammal-eating clan were captured for the aquarium trade in the 1970s, they starved themselves for seventy-eight days before eating the salmon being proffered, and then they ate the fish only after they had performed a strange ceremony. The two whales held gently onto either end of a dead salmon, and swam a single lap around their pool with it in their mouths, before dividing the fish between themselves and consuming it.
+
+Killer whales are strongly xenophobic. Clans of salmon eaters never mix with mammal eaters, for example. Genetic studies show that clans with different food taboos don’t interbreed, leading to slightly different appearances and genetic makeup. Each clan has a distinctive dialect of vocalizations (perhaps we should call them languages), which facilitates coordination of their work, division of their labor, and care of one another.
+
+At times, killer whales have developed special relationships with people. During the nineteenth and early twentieth centuries, at Twofold Bay south of Sydney, Australia, killer whales and humans set up a mutually profitable whaling enterprise. The killer whales would notify the whalers of the presence of humpback whales by performing a ritual in the waters of the bay fronting the whaler’s cottagers. The men would harpoon the humpbacks, and the killer whales would hold on to the harpoon ropes to tire the prey.
+
+After a humpback was lanced and killed by the men, they observed the “law of the tongue.” The whalers would leave the humpback body for twenty-four hours so that the killers could feast on the lips and tongue. Remarkable proof of this partnership persists, in the form of the skeleton of “Old Tom”—a killer whale whose teeth were worn flat on one side while holding onto harpoon ropes—which can be seen in the killer whale museum in the town of Eden, Australia.
+
+With the exception of our species, killer whales are earth’s most capable predators. When they evolved ten million years ago, half of earth’s whales, seals, and dugong species became extinct. Because they specialize in a particular food type and are so intelligent, killer whales continue to have a huge impact on their prey. As a result of global warming, killer whales have appeared in Arctic waters. Horrified Inuit describe them as voracious and wasteful killers that have reduced populations of some Arctic mammals by a third.
+
+Safina comes to an unfamiliar but empirically based conclusion: prior to the domestication of plants and the invention of writing, the differences between human societies and those of elephants, dogs, killer whales, and dolphins was a matter of degree, not kind. Why, he asks, has it taken us so long to understand this? Are our egos “threatened by the thought that other animals think and feel? Is it because acknowledging the mind of another makes it harder to abuse them?”
+
+The discovery of nonhuman societies composed of highly intelligent, social, empathetic individuals possessing sophisticated communication systems will force us to reformulate many questions. We have long asked whether we are alone in the universe. But clearly we are not alone on earth. The evolution of intelligence, of empathy and complex societies, is surely more likely than we have hitherto considered. And what is it, exactly, that sets our species apart? We clearly are different, but in light of Beyond Words we need to reevaluate how, and why.
+
+Beyond Words will have a deep impact on many readers, for it elevates our relationships with animals to a higher plane. When your dog looks at you adoringly, even though he or she cannot say it, you can be as sure that love is being expressed as you can when hearing any human declaration of eternal devotion. Most of us already knew that, but have withheld ourselves from a full surrender to its implications. Along with Darwin’s Origin and Richard Dawkins’s Selfish Gene, Beyond Words marks a major milestone in our evolving understanding of our place in nature. Indeed it has the potential to change our relationship with the natural world.
+Rendering process works as follows:
+
+When a state is received in the app.renderCh channel, it triggers the rendering function. In our case it will be React, but it could be any other view framework.
+The process will be "busy" until the next animation frame. That means it will not trigger the rendering function if a new state is received and rendering is taking place.
+If a new state is put in the channel, and there's already a state waiting to be rendered, the older state will be discarded, and only the new state will be rendered.
+Let's start with number 3. That logic is ready for us in the js-csp library (and in core async too). Change the definition of app.renderCh to:
+
+Let's pick one functionality in our app: adding a new word to the state.words list. First, let's implement the function that receives the old state and the word to add, and then returns the new state with the word added:
+
+Many of the best researchers in the world are forced to choose between high-paying engineering work to support their families or doing the work they really want to do; the fact that this is an either/or choice is bad for all of us.  
+
+
+Drug companies have a problem: they are finding it ever harder to get painkillers through clinical trials. But this isn't necessarily because the drugs are getting worse. An extensive analysis of trial data1 has found that responses to sham treatments have become stronger over time, making it harder to prove a drug’s advantage over placebo.
+
+The change in reponse to placebo treatments for pain, discovered by researchers in Canada, holds true only for US clinical trials. "We were absolutely floored when we found out," says Jeffrey Mogil, who directs the pain-genetics lab at McGill University in Montreal and led the analysis. Simply being in a US trial and receiving sham treatment now seems to relieve pain almost as effectively as many promising new drugs. Mogil thinks that as US trials get longer, larger and more expensive, they may be enhancing participants’ expectations of their effectiveness.
+
+Stronger placebo responses have already been reported for trials of antidepressants and antipsychotics2, 3, triggering debate over whether growing placebo effects are seen in pain trials too. To find out, Mogil and his colleagues examined 84 clinical trials of drugs for the treatment of chronic neuropathic pain (pain which affects the nervous system) published between 1990 and 2013.
+
+Related stories
+Tackling the US pain epidemic
+Neuroscience: Shooting pain
+Jeffrey Mogil
+Based on patients’ ratings of their pain, the effect of trialled drugs in relieving symptoms stayed the same over the 23-year period — but placebo responses rose. In 1996, patients in clinical trials reported that drugs relieved their pain by 27% more than did a placebo. But by 2013, that gap had slipped to just 9%. The phenomenon is driven by 35 US trials; among trials in Europe, Asia and elsewhere, there was no significant change in placebo reponses.The analysis is in press in the journal Pain1.
+
+Only in America
+This effect would explain why drug companies have trouble getting new painkillers through trials, notes neuroscientist Fabrizio Benedetti, who studies placebo responses at the University of Turin, Italy. Over the past ten years, he says, more than 90% of potential drugs for treatment of neuropathic and cancer pain have failed at advanced phases of clinical trials.
+
+But the finding that placebo responses are rising only in the United States is the most surprising aspect of the latest analysis. One possible explanation is that direct-to-consumer advertising for drugs — allowed only in the United States and New Zealand — has increased people’s expectations of the benefits of drugs, creating stronger placebo effects. But Mogil’s results hint at another factor. "Our data suggest that the longer a trial is and the bigger a trial is, the bigger the placebo is going to be," he says.
+
+Longer, bigger US trials probably cost more, and the glamour and gloss of their presentation might indirectly enhance patients’ expectations, Mogil speculates. Some larger US trials also use contract research organizations that can employ nurses who are dedicated to the trial patients, he adds — giving patients a very different experience compared to those who take part in a small trial run by an academic lab, for instance, where research nurses may have many other responsibilities.
+
+No pain, no gain?
+Mogil's data also challenge one of the fundamental principles of placebo-controlled trials — that comparing a drug against placebo tells us how well a drug works. A basic principle of these trials is that drug and placebo effects are additive: our total response to any drug we take is equal to the placebo response plus the drug's biochemical effect. But Mogil found that although placebo responses have increased over time, drug responses haven't risen by the same amount.
+
+That suggests placebo and drug responses may not always be strictly additive. This isn't entirely unexpected, Mogil argues, because both placebos and pharmaceutical painkillers tap into similar biological mechanisms — such as the release of endorphins in the brain. But if true, it suggests that growing placebo responses are masking real painkilling effects. “There are a lot of people in the pain field who believe the drugs that are failing clinical trials actually work, it’s just that the trials can’t show it," he says.
+
+For companies trying to develop treatments, one remedy might be to compare new drugs against their best competitors instead of against placebo — or to go back to conducting smaller, shorter trials. Benedetti is not convinced, however. "I don’t think that controlling the placebo response will increase the number of successful trials," he says. "What drug companies have to do is to find more effective drugs."
+
+Mogil suggests it is also worth investigating the elements that generate the more powerful placebo response in US trials, and then incorporating those elements (such as the relationship between patient and nurse) into patient care. Ted Kaptchuk, director of placebo research at Harvard Medical School in Boston, Massachusetts, agrees. "If the major component of a drug in any particular condition is its placebo component, we need to develop non-pharmacological interventions as a first-line response," he says.

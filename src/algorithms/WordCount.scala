@@ -24,7 +24,7 @@ class WordCount extends MapReduce[String, String, Int] {
      val result = HashMap[String, Int]()
      
      for ((key, values) <- pairs) {
-       result.+=(key -> result.getOrElse(key, 0).+(values.sum))
+       result.+=(key -> values.sum)
      }
      result.toMap
   }

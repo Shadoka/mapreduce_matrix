@@ -1,6 +1,6 @@
-package test
+package demo
 
-import algorithms.WordCount
+import algorithm.WordCount
 import scala.io.Source
 
 object WordMapReduce {

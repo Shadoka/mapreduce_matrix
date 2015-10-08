@@ -1,4 +1,4 @@
-package algorithms
+package algorithm
 
 import scala.collection.mutable.HashMap
 import scala.collection.mutable.ListBuffer
@@ -26,11 +26,7 @@ class MatrixMultiplication extends MapReduce[(Int, Int, Int), Int, Int] {
     val result = HashMap[Int, Int]()
     
     for ((key, values) <- groups) {
-    	if (result.contains(key)) {
-    	  result.+=(key -> result.get(key).get.+(values.sum))
-    	} else {
-    	  result.+=(key -> values.sum)
-    	}
+    	result.+=(key -> result.getOrElse(key, 0).+(values.sum))
     }
     result.toMap
   }

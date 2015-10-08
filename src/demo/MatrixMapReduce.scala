@@ -1,11 +1,11 @@
-package test
+package demo
 
 import scala.collection.mutable.ListBuffer
-import algorithms.MatrixMultiplication
 import model.Matrix
 import model.Vector
+import algorithm.MatrixMultiplication
 
-object Main {
+object MatrixMapReduce {
 
   def main(args: Array[String]) {
 	  val process = new MatrixMultiplication()
@@ -17,7 +17,7 @@ object Main {
   }
   
   def print (result: Map[Int, Int]) {
-    for ((i, v) <- result.toSeq.sortBy(_._1)) println(i + " ->" + v)    
+    for ((i, v) <- result.toSeq.sortBy(_._1)) println(i + " -> " + v)    
   }
   
 }

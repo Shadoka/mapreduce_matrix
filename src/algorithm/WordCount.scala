@@ -1,4 +1,4 @@
-package algorithms
+package algorithm
 
 import model.MapReduce
 import scala.collection.mutable.HashMap
